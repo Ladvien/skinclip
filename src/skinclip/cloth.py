@@ -45,11 +45,18 @@ DAMPING = 0.92  # the share of the last step's velocity a particle keeps
 PULL_KNEE = 0.08  # per iteration, toward the shape the anchor carries the chain in
 PULL_HEM = 0.05
 RING_LIMIT = 1.15  # neighbours' knees (and hems) may be this far apart, times their rest distance
-CLEARANCE_M = 0.05  # a chain keeps this far off a capsule's surface (the cloth is thick, and a calf is wider than its capsule)
+CLEARANCE_M = 0.05  # a chain keeps this far off a capsule's surface (0.05 pushed the skirt off the thighs it rests 2 cm from at rest)
 LOOP_PASSES = 4
 SETTLE_FRAMES = 30
+MAX_PUSH_M = 0.03  # the most a collision moves a chain in one iteration, so a hand arriving does not fling a knee
+MIN_CONTACT = 0.35  # a hit on a top-knee segment nearer its pinned top than this is left alone: moving the knee cannot clear it
 MIN_LEVER = 0.25  # a collision near a chain's pinned top moves its knee by at most 4 times the push
-COLLIDERS = ("thigh", "calf", "foot", "hand", "lowerarm")
+# The capsules the chains keep out of. The legs are under the skirt, so a chain in their way goes outward, over them. The
+# hands and forearms hang outside it, so a chain in their way is pressed the short way, in against the body: pushed
+# "over" a hand it would wrap the skirt round the far side of the arm (a hand 10 cm outside a chain flung the knee 47 cm).
+OVER = ("thigh", "calf", "foot")
+BESIDE = ("hand", "lowerarm")
+COLLIDERS = OVER + BESIDE
 
 
 @dataclass(frozen=True)
@@ -208,7 +215,7 @@ class _Simulation:
         rest_bt: np.ndarray,
         rest_ring_b: np.ndarray,
         rest_ring_t: np.ndarray,
-        tracks: list[tuple[np.ndarray, np.ndarray, float]],
+        tracks: list[tuple[np.ndarray, np.ndarray, float, bool]],
         ground: tuple[int, float],
         ring_axis: np.ndarray,
     ) -> None:
@@ -216,7 +223,7 @@ class _Simulation:
         self.ring_axis = ring_axis  # (F, 3): the ring's own up, carried by the body (it lies down when the body does)
         self.rest_ab, self.rest_bt = rest_ab, rest_bt
         self.rest_ring_b, self.rest_ring_t = rest_ring_b, rest_ring_t
-        self.tracks = tracks  # per capsule (start (F, 3), end (F, 3), radius)
+        self.tracks = tracks  # per capsule (start (F, 3), end (F, 3), radius, goes over: the chain passes over it, not round)
         self.ground = ground
         self.b = rigid_b[0].copy()
         self.t = rigid_t[0].copy()
@@ -229,7 +236,7 @@ class _Simulation:
             lerp = lambda x: x[frame] + (x[to_frame] - x[frame]) * alpha  # noqa: E731
             a, rigid_b, rigid_t = lerp(self.rigid_a), lerp(self.rigid_b), lerp(self.rigid_t)
             axis = _normalise(lerp(self.ring_axis))
-            colliders = [(lerp(start), lerp(end), radius) for start, end, radius in self.tracks]
+            colliders = [(lerp(start), lerp(end), radius, over) for start, end, radius, over in self.tracks]
             old_b, old_t = self.b.copy(), self.t.copy()
             self.b = self.b + (self.b - self.b_prev) * DAMPING
             self.t = self.t + (self.t - self.t_prev) * DAMPING
@@ -263,8 +270,8 @@ class _Simulation:
             neighbour_index = (np.arange(len(points)) + 1) % len(points)
             np.add.at(points, neighbour_index, -correction)
 
-    def _collide(self, a: np.ndarray, colliders: list[tuple[np.ndarray, np.ndarray, float]], axis: np.ndarray) -> None:
-        """Pushes the chains out of every capsule, away from the body: outward from the ring's centre in the ring's own
+    def _collide(self, a: np.ndarray, colliders: list[tuple[np.ndarray, np.ndarray, float, bool]], axis: np.ndarray) -> None:
+        """Pushes the chains out of every capsule. Out of a leg (`over`) it is away from the body: outward from the ring's centre in the ring's own
         plane (horizontal for a standing body, along the floor for a lying one), over the capsule. The shortest way out of
         a capsule can be inward or sideways, and then the two chains either side of a leg go round it opposite ways and the
         cloth that joins them is stretched across it. (Taking the shortest way unless it points inward was tried: it
@@ -276,7 +283,7 @@ class _Simulation:
         around = np.roll(np.arange(count), -1)
         each = np.arange(count)
         centre = a.mean(0)
-        for start, end, radius in colliders:
+        for start, end, radius, over in colliders:
             mid_a, mid_b, mid_t = (a + a[around]) / 2.0, (self.b + self.b[around]) / 2.0, (self.t + self.t[around]) / 2.0
             p1 = np.concatenate([a, self.b, mid_a, mid_b])
             q1 = np.concatenate([self.b, self.t, mid_b, mid_t])
@@ -286,16 +293,25 @@ class _Simulation:
             reach = radius + CLEARANCE_M
             squared = np.einsum("pi,pi->p", offset, offset)
             hit = squared < reach * reach
+            hit[:count] &= s[:count] >= MIN_CONTACT  # the top-knee segments (rows 0..count) and the middle ones (2 count..3 count)
+            hit[2 * count : 3 * count] &= s[2 * count : 3 * count] >= MIN_CONTACT
             if not hit.any():
                 continue
-            outward = c1 - centre
-            outward -= np.einsum("pi,i->p", outward, axis)[:, None] * axis  # in the ring's own plane
-            outward /= np.maximum(np.linalg.norm(outward, axis=1), 1e-9)[:, None]
-            # Slide along `outward` until the distance to the capsule's axis is `reach`: |offset + t outward| = reach.
-            along = np.einsum("pi,pi->p", offset, outward)
-            across = squared - along * along
-            slide = np.maximum(-along + np.sqrt(np.maximum(reach * reach - across, 0.0)), 0.0)
-            push = np.where(hit[:, None], outward * slide[:, None], 0.0)
+            if over:
+                outward = c1 - centre
+                outward -= np.einsum("pi,i->p", outward, axis)[:, None] * axis  # in the ring's own plane
+                outward /= np.maximum(np.linalg.norm(outward, axis=1), 1e-9)[:, None]
+                # Slide along `outward` until the distance to the capsule's axis is `reach`: |offset + t outward| = reach.
+                along = np.einsum("pi,pi->p", offset, outward)
+                across = squared - along * along
+                slide = np.maximum(-along + np.sqrt(np.maximum(reach * reach - across, 0.0)), 0.0)
+                push = np.where(hit[:, None], outward * slide[:, None], 0.0)
+            else:
+                distance = np.sqrt(squared)
+                push = np.where(hit[:, None], offset / np.maximum(distance, 1e-9)[:, None] * (reach - distance)[:, None], 0.0)
+            if not over:  # a hand arriving must not fling a knee; a leg that has to go through the cloth is not capped
+                length = np.linalg.norm(push, axis=1)
+                push = push * np.minimum(1.0, MAX_PUSH_M / np.maximum(length, 1e-9))[:, None]
             ab, bt, mab, mbt = (push[i * count : (i + 1) * count] for i in range(4))
             sab, sbt, smab, smbt = (s[i * count : (i + 1) * count, None] for i in range(4))
             # A is pinned: segment A-B moves B by what it takes to move the point at s by the push (s kept off zero), B-T
@@ -355,7 +371,7 @@ def bake(
     up_vector = np.eye(3)[axis]
     ring_axis = _normalise(np.einsum("fcij,j->fi", carry[..., :3, :3], up_vector) / count)
     tracks = [
-        (start, end, radius)
+        (start, end, radius, role.rpartition("_")[0] in OVER)
         for role, (start, end, radius) in capsules_by_role.items()
         if role.rpartition("_")[0] in COLLIDERS
     ]

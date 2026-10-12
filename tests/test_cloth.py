@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import numpy as np
@@ -142,3 +143,18 @@ def test_chain_nodes_are_world_aligned_at_rest(rig):
     for name in ("skirt_00_a", "skirt_05_b"):
         rotation = quat.from_matrix(worlds[skeleton.index(name), :3, :3])
         assert np.allclose(rotation, quat.IDENTITY, atol=1e-6) or np.allclose(rotation, -quat.IDENTITY, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"count": 2},
+        {"prefix": ""},
+        {"knee_height_m": 0.95},  # the knee above the top
+        {"hem_height_m": 0.55},  # the hem above the knee
+        {"blend_height_m": 0.90},  # nothing to blend over
+    ],
+)
+def test_a_ring_skirt_spec_whose_heights_do_not_rise_is_refused(fields):
+    with pytest.raises(ValueError):
+        cloth.RingSkirtSpec(**{**dataclasses.asdict(SPEC), **fields})

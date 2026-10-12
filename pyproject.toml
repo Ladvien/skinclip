@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skinclip"
-version = "0.1.1"
+version = "0.1.2"
 description = "Does a skinned character's animation pass its surface through itself? A numpy-only checker, limb repair and cloth chains for glTF skins."
 readme = "README.md"
 license = { text = "MIT" }
