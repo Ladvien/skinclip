@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skinclip"
+version = "0.1.0"
+description = "Does a skinned character's animation pass its surface through itself? A numpy-only checker, limb repair and cloth chains for glTF skins."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+# numpy is imported but not declared. blended puts its venv's site-packages ahead of Blender's own, so a declared
+# numpy wheel would shadow Blender's bundled numpy (blended mistake record
+# `the-blender-test-layer-imported-the-venvs-numpy-and-pillow`). Install the extra where no numpy exists yet.
+dependencies = []
+
+[project.optional-dependencies]
+numpy = ["numpy>=1.25"]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
