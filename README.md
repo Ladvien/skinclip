@@ -36,7 +36,8 @@ python3 -m pytest -q
 | `skinclip.humanoid` | `ROLES`, `UE5`, `MIXAMO`, `detect(names)` |
 | `skinclip.capsules` | `Capsule`, `measure(figure, roles)`, `positions(figure, worlds, capsules)` |
 | `skinclip.repair` | `repair(figure, roles, capsules, rot, root_translation, loop, half_spaces)`, `HalfSpace`, `RepairReport` |
-| `skinclip.cloth` | `RingSkirtSpec`, `ring_skirt_layout`, `ring_skirt_weights`, `bake`, `chain_nodes` |
+| `skinclip.spec` | `RingSkirtSpec` (imports nothing, so a harness without numpy can name it) |
+| `skinclip.cloth` | `RingSkirtSpec` (re-exported), `ring_skirt_layout`, `ring_skirt_weights`, `bake`, `chain_nodes` |
 | `skinclip.testing` | `tube_humanoid(path, names, clip)`: a skinned tube humanoid with a hand-through-torso clip, for tests |
 
 Every array is numpy; quaternions are glTF order (x, y, z, w); lengths are metres.
