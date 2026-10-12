@@ -3,9 +3,13 @@
 Generated and retargeted motion crosses itself most often where a hand or a knee goes through the torso or the other
 limb. Each limb is a capsule (`capsules.py`) and a frame is repaired by the smallest rotation of the upper and lower
 limb joints that leaves every capsule pair apart: minimise 1e4 * sum(max(depth, 0)^2) + |delta|^2 over the rotation
-vectors `delta` with a box on every component, by projected gradient descent with an Armijo backtracking line search
-(no scipy: Blender's Python has none). The per-frame answers are smoothed over time (a gaussian, in two passes with a
-re-solve of what the smoothing let back in) so the repaired motion does not jitter, and a loop stays a loop.
+vectors `delta` with a box on every component. The sum of squares is solved as a least-squares problem by
+Levenberg-Marquardt (Marquardt, "An algorithm for least-squares estimation of nonlinear parameters", SIAM J. Appl.
+Math. 1963, doi:10.1137/0111030) with a finite-difference Jacobian and the box applied by clipping the step: no scipy,
+because Blender's Python has none. (Projected gradient descent with an Armijo line search was the first solver; it took
+90 s to repair the 114 frames of one kneeling clip, because the penalty makes the problem stiff, and this takes seconds
+for the same answer.) The per-frame answers are smoothed over time (a gaussian, in two passes with a re-solve of what
+the smoothing let back in) so the repaired motion does not jitter, and a loop stays a loop.
 
 Penalty methods for interpenetration constraints are standard in cloth and character solvers (Grigorev et al.,
 *ContourCraft*, SIGGRAPH 2024, doi:10.1145/3641519.3657408, for the contour as a measure); the segment-segment
@@ -23,11 +27,12 @@ from dataclasses import dataclass
 import numpy as np
 
 from . import capsules as capsules_module
+from . import linalg
 from . import pose
 from .capsules import Capsule
 from .intersect import segment_distance
 from .model import Clip, Figure
-from .quat import exp_map, multiply, trs_matrix
+from .quat import exp_map, multiply, quat_matrix
 
 MARGIN_M = 0.005
 PENALTY = 1e4
@@ -35,11 +40,10 @@ BOUND_RAD = 0.45
 DILATE_FRAMES = 6
 FIRST_SIGMA = 2.0
 SECOND_SIGMA = 1.0
-MAX_ITERATIONS = 60
-GRADIENT_STEP = 1e-4
-ARMIJO = 1e-4
-MIN_STEP = 1e-6
-STOP_STEP = 1e-5
+MAX_ITERATIONS = 20
+MAX_TRIALS = 8  # damping increases tried per iteration before the solve gives up on improving
+JACOBIAN_STEP = 1e-6
+STOP_STEP = 1e-6
 ACTIVE_DELTA = 1e-6
 
 _OBSTACLE_TRUNK = ("pelvis", "spine_01", "spine_02", "spine_03", "neck", "head")
@@ -49,6 +53,8 @@ _LIMBS = {
     "leg": ("pelvis", ("thigh", "calf", "foot", "ball")),
 }
 _ARM_MOVERS = ("upperarm", "lowerarm", "hand")
+# The capsules that keep clear of an extra obstacle: the forearms and hands, which reach into a skirt.
+_OBSTACLE_MOVERS = tuple(f"{role}_{side}" for role in ("lowerarm", "hand") for side in ("l", "r"))
 _LEG_MOVERS = ("calf", "foot")
 
 
@@ -118,8 +124,11 @@ class _Solver:
         root_translation: np.ndarray,
         half_spaces: tuple[HalfSpace, ...],
         fps: float,
+        margin_m: float,
+        obstacles: dict[str, tuple[np.ndarray, np.ndarray, float]],
     ) -> None:
         self.figure, self.roles, self.capsules, self.rot, self.fps = figure, roles, capsules, rot, fps
+        self.margin_m = margin_m
         self.root_translation = root_translation
         self.half_spaces = half_spaces
         self.frames = len(root_translation)
@@ -130,11 +139,16 @@ class _Solver:
         rest_positions = capsules_module.positions(figure, rest, capsules)
         self.skip = {pair for pair in self.pairs if self._depth(pair, rest_positions, 0) > 0.0}
         self.pairs = [pair for pair in self.pairs if pair not in self.skip]
+        # Extra obstacles (a skirt's chains) are the arms' to keep clear of; they move with the clip, not with the limbs.
+        self.obstacles = {name: (np.asarray(s, float), np.asarray(e, float)) for name, (s, e, _) in obstacles.items()}
+        self.radius.update({name: float(radius) for name, (_, _, radius) in obstacles.items()})
+        self.pairs += [(mover, name) for name in obstacles for mover in _OBSTACLE_MOVERS if mover in capsules]
         self.worlds = self.node_worlds(rot)
         self.fixed = capsules_module.positions(figure, self.worlds, capsules)
+        self.fixed.update(self.obstacles)
         sk = figure.skeleton
         self.rest_t, self.rest_s = sk.rest_t, sk.rest_s
-        self.bind = np.linalg.inv(figure.inverse_bind)
+        self.bind = linalg.inverse_affine(figure.inverse_bind)
         self.slot = {sk.names[node]: i for i, node in enumerate(figure.joints)}
 
     def node_worlds(self, rot: dict[str, np.ndarray]) -> np.ndarray:
@@ -146,7 +160,7 @@ class _Solver:
         s1, e1 = positions[a]
         s2, e2 = positions[b]
         distance = segment_distance(s1[frame : frame + 1], e1[frame : frame + 1], s2[frame : frame + 1], e2[frame : frame + 1])[0]
-        return self.radius[a] + self.radius[b] + MARGIN_M - float(distance)
+        return self.radius[a] + self.radius[b] + self.margin_m - float(distance)
 
     # ---- depths of a whole clip ----
 
@@ -154,6 +168,7 @@ class _Solver:
         """(F,) the deepest penetration of any pair (or half space violation) in each frame, 0 when none."""
         worlds = self.node_worlds(rot)
         positions = capsules_module.positions(self.figure, worlds, self.capsules)
+        positions.update(self.obstacles)
         worst = np.zeros(self.frames)
         if self.pairs:
             starts1 = np.concatenate([positions[a][0] for a, _ in self.pairs])
@@ -161,7 +176,7 @@ class _Solver:
             starts2 = np.concatenate([positions[b][0] for _, b in self.pairs])
             ends2 = np.concatenate([positions[b][1] for _, b in self.pairs])
             distance = segment_distance(starts1, ends1, starts2, ends2).reshape(len(self.pairs), self.frames)
-            radii = np.array([self.radius[a] + self.radius[b] + MARGIN_M for a, b in self.pairs])
+            radii = np.array([self.radius[a] + self.radius[b] + self.margin_m for a, b in self.pairs])
             worst = np.maximum(worst, (radii[:, None] - distance).max(0))
         for plane in self.half_spaces:
             for role in plane.capsules:
@@ -172,7 +187,7 @@ class _Solver:
     def _violation(self, plane: HalfSpace, role: str, worlds: np.ndarray, end: np.ndarray) -> np.ndarray:
         """How far the capsule's end, less its radius, is behind the plane, per frame (end shaped (F, 3))."""
         node = self.figure.skeleton.index(plane.frame)
-        to_bind = self.bind[self.slot[plane.frame]][None] @ np.linalg.inv(worlds[:, node])
+        to_bind = self.bind[self.slot[plane.frame]][None] @ linalg.inverse_affine(worlds[:, node])
         local = np.einsum("fij,fj->fi", to_bind[:, :3, :3], end) + to_bind[:, :3, 3]
         return plane.offset_m - (local @ np.asarray(plane.normal) - self.radius[role])
 
@@ -193,11 +208,27 @@ class _Solver:
     def solve(self, frame: int, limbs: list[tuple[str, str]], start: np.ndarray) -> np.ndarray:
         """The rotation vectors (6 per limb: upper, lower) that clear this frame, from `start` (len(limbs) * 6)."""
         scene = _Scene(self, frame, limbs)
-        return _minimise(scene.objective, start, BOUND_RAD)
+        return _minimise(scene.residuals, start, BOUND_RAD)
+
+
+def _rodrigues(v: np.ndarray) -> np.ndarray:
+    """Rotation matrices (B, 3, 3) of rotation vectors (B, 3): I + sin(t)/t K + (1 - cos(t))/t^2 K^2."""
+    theta = np.linalg.norm(v, axis=1)
+    a = np.sinc(theta / np.pi)
+    b = 0.5 * np.sinc(theta / (2.0 * np.pi)) ** 2
+    x, y, z = v[:, 0], v[:, 1], v[:, 2]
+    r = np.empty((len(v), 3, 3))
+    r[:, 0, 0] = 1 - b * (y * y + z * z)
+    r[:, 1, 1] = 1 - b * (x * x + z * z)
+    r[:, 2, 2] = 1 - b * (x * x + y * y)
+    r[:, 0, 1], r[:, 1, 0] = b * x * y - a * z, b * x * y + a * z
+    r[:, 0, 2], r[:, 2, 0] = b * x * z + a * y, b * x * z - a * y
+    r[:, 1, 2], r[:, 2, 1] = b * y * z - a * x, b * y * z + a * x
+    return r
 
 
 class _Scene:
-    """The objective of one frame over the rotation vectors of the active limbs, batched over candidate vectors."""
+    """The residuals of one frame over the rotation vectors of the active limbs, batched over candidate vectors."""
 
     def __init__(self, solver: _Solver, frame: int, limbs: list[tuple[str, str]]) -> None:
         self.solver, self.frame, self.limbs = solver, frame, limbs
@@ -207,110 +238,123 @@ class _Scene:
             parent_role, chain = _LIMBS[kind]
             parent = f"{parent_role}_{side}" if kind == "arm" else parent_role
             joints = [solver.roles[f"{role}_{side}"] for role in chain]
+            nodes = [sk.index(j) for j in joints]
+            parent_world = solver.worlds[frame, sk.index(solver.roles[parent])]
             self.chains.append(
                 {
                     "kind": kind,
                     "side": side,
-                    "parent": solver.worlds[frame, sk.index(solver.roles[parent])],
                     "joints": joints,
-                    "nodes": [sk.index(j) for j in joints],
-                    "q": [solver.rot[j][frame] for j in joints],
+                    "root_rotation": parent_world[:3, :3],
+                    "root_position": parent_world[:3, 3],
+                    "base": [quat_matrix(solver.rot[j][frame]) for j in joints],
+                    "scale": [solver.rest_s[n] for n in nodes],
+                    "translation": [solver.rest_t[n] for n in nodes],
                 }
             )
         moving = set()
         for chain in self.chains:
             moving |= {f"{role}_{chain['side']}" for role in _LIMBS[chain["kind"]][1]}
-        self.moving = moving
         involved = [(a, b) for a, b in solver.pairs if a in moving or b in moving]
         self.pairs = involved
-        roles = sorted({r for pair in involved for r in pair})
-        self.roles = roles
-        self.index = {role: i for i, role in enumerate(roles)}
+        self.roles = sorted({r for pair in involved for r in pair})
+        self.index = {role: i for i, role in enumerate(self.roles)}
         self.a = np.array([self.index[a] for a, _ in involved], int)
         self.b = np.array([self.index[b] for _, b in involved], int)
-        self.margin = np.array([solver.radius[a] + solver.radius[b] + MARGIN_M for a, b in involved])
-        self.planes = [(plane, role) for plane in solver.half_spaces for role in plane.capsules if role in solver.capsules and role in self.moving]
+        self.margin = np.array([solver.radius[a] + solver.radius[b] + solver.margin_m for a, b in involved])
+        # roles the limbs produce (their capsules exist and a pair uses them) and the fixed rest
+        self.produced = {f"{role}_{c['side']}" for c in self.chains for role in _LIMBS[c["kind"]][1] if f"{role}_{c['side']}" in self.index and f"{role}_{c['side']}" in solver.capsules}
+        self.fixed_roles = [role for role in self.roles if role not in self.produced]
+        self.fixed_index = np.array([self.index[r] for r in self.fixed_roles], int)
+        self.fixed_start = np.array([solver.fixed[r][0][frame] for r in self.fixed_roles]).reshape(-1, 3)
+        self.fixed_end = np.array([solver.fixed[r][1][frame] for r in self.fixed_roles]).reshape(-1, 3)
+        self.planes = [(plane, role) for plane in solver.half_spaces for role in plane.capsules if role in self.produced]
         self.to_bind = {}
         for plane, _ in self.planes:
             node = sk.index(plane.frame)
-            self.to_bind[plane.frame] = solver.bind[solver.slot[plane.frame]] @ np.linalg.inv(solver.worlds[frame, node])
+            self.to_bind[plane.frame] = solver.bind[solver.slot[plane.frame]] @ linalg.inverse_affine(solver.worlds[frame, node])
 
-    def endpoints(self, delta: np.ndarray) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-        """Start and end (B, 3) of every capsule role of the scene for a batch of rotation vectors (B, 6 * limbs)."""
+    def endpoints(self, delta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Start and end (roles, B, 3) of every capsule of the scene for a batch of rotation vectors (B, 6 * limbs)."""
         solver = self.solver
         batch = len(delta)
-        out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        starts = np.empty((len(self.roles), batch, 3))
+        ends = np.empty((len(self.roles), batch, 3))
+        if len(self.fixed_index):
+            starts[self.fixed_index] = self.fixed_start[:, None, :]
+            ends[self.fixed_index] = self.fixed_end[:, None, :]
         for k, chain in enumerate(self.chains):
-            matrix = np.broadcast_to(chain["parent"], (batch, 4, 4))
-            world = []
-            for j, node in enumerate(chain["nodes"]):
-                q = np.broadcast_to(chain["q"][j], (batch, 4))
+            rotation = np.broadcast_to(chain["root_rotation"], (batch, 3, 3))
+            position = np.broadcast_to(chain["root_position"], (batch, 3))
+            worlds = []
+            for j in range(len(chain["joints"])):
+                position = position + rotation @ chain["translation"][j]
+                local = chain["base"][j]
                 if j < 2:
-                    q = multiply(q, exp_map(delta[:, 6 * k + 3 * j : 6 * k + 3 * j + 3]))
-                local = trs_matrix(np.broadcast_to(solver.rest_t[node], (batch, 3)), q, np.broadcast_to(solver.rest_s[node], (batch, 3)))
-                matrix = matrix @ local
-                world.append(matrix)
+                    local = local @ _rodrigues(delta[:, 6 * k + 3 * j : 6 * k + 3 * j + 3])
+                rotation = rotation @ (local * chain["scale"][j])
+                worlds.append((rotation, position))
             for j, role in enumerate(_LIMBS[chain["kind"]][1]):
                 name = f"{role}_{chain['side']}"
-                capsule = solver.capsules.get(name)
-                if capsule is None:
+                if name not in self.produced:
                     continue
-                start = world[j]
+                capsule = solver.capsules[name]
+                rotation_j, position_j = worlds[j]
+                row = self.index[name]
+                starts[row] = position_j
                 if capsule.end is None:
-                    end = np.einsum("bij,j->bi", start[:, :3, :3], capsule.centroid_offset) + start[:, :3, 3]
+                    ends[row] = rotation_j @ capsule.centroid_offset + position_j
                 else:
-                    end = world[chain["joints"].index(capsule.end)][:, :3, 3]
-                out[name] = (start[:, :3, 3], end)
-        for role in self.roles:
-            if role not in out:
-                s, e = solver.fixed[role]
-                out[role] = (np.broadcast_to(s[self.frame], (batch, 3)), np.broadcast_to(e[self.frame], (batch, 3)))
-        return out
+                    ends[row] = worlds[chain["joints"].index(capsule.end)][1]
+        return starts, ends
 
-    def objective(self, delta: np.ndarray) -> np.ndarray:
-        """(B,) 1e4 * sum of positive depths squared + sum of squared rotation vector lengths, for a batch (B, V)."""
+    def residuals(self, delta: np.ndarray) -> np.ndarray:
+        """(B, R) the residual vector whose squared length is 1e4 * sum of positive depths squared + sum of squared rotation
+        vector lengths, for a batch of rotation vectors (B, V)."""
         batch = len(delta)
-        positions = self.endpoints(delta)
-        total = np.sum(delta * delta, axis=1)
+        starts, ends = self.endpoints(delta)
+        parts = []
         if len(self.pairs):
-            s1 = np.stack([positions[self.roles[i]][0] for i in self.a], 0)  # (P, B, 3)
-            e1 = np.stack([positions[self.roles[i]][1] for i in self.a], 0)
-            s2 = np.stack([positions[self.roles[i]][0] for i in self.b], 0)
-            e2 = np.stack([positions[self.roles[i]][1] for i in self.b], 0)
             pairs = len(self.pairs)
-            distance = segment_distance(s1.reshape(-1, 3), e1.reshape(-1, 3), s2.reshape(-1, 3), e2.reshape(-1, 3)).reshape(pairs, batch)
-            total = total + PENALTY * np.sum(np.maximum(self.margin[:, None] - distance, 0.0) ** 2, axis=0)
+            distance = segment_distance(
+                starts[self.a].reshape(-1, 3), ends[self.a].reshape(-1, 3), starts[self.b].reshape(-1, 3), ends[self.b].reshape(-1, 3)
+            ).reshape(pairs, batch)
+            parts.append(PENALTY**0.5 * np.maximum(self.margin[:, None] - distance, 0.0).T)
         for plane, role in self.planes:
             to_bind = self.to_bind[plane.frame]
-            end = positions[role][1]
-            local = end @ to_bind[:3, :3].T + to_bind[:3, 3]
+            local = ends[self.index[role]] @ to_bind[:3, :3].T + to_bind[:3, 3]
             violation = plane.offset_m - (local @ np.asarray(plane.normal) - self.solver.radius[role])
-            total = total + PENALTY * np.maximum(violation, 0.0) ** 2
-        return total
+            parts.append(PENALTY**0.5 * np.maximum(violation, 0.0)[:, None])
+        parts.append(delta)
+        return np.concatenate(parts, axis=1)
 
 
-def _minimise(objective: Callable[[np.ndarray], np.ndarray], x0: np.ndarray, bound: float) -> np.ndarray:
-    """Projected gradient descent on a box [-bound, bound], central-difference gradient (one batched call), step
-    halved until the Armijo condition holds, doubled for the next iteration."""
+def _minimise(residuals: Callable[[np.ndarray], np.ndarray], x0: np.ndarray, bound: float) -> np.ndarray:
+    """Levenberg-Marquardt on the residual vector (batched calls), the box [-bound, bound] applied by clipping each step.
+    The Jacobian is one batched forward difference per iteration; the damping falls on a step that lowers the squared
+    residual and rises (up to MAX_TRIALS times) on one that does not."""
+    n = len(x0)
     x = np.clip(x0, -bound, bound)
-    value = float(objective(x[None])[0])
-    alpha = 1.0
-    n = len(x)
+    r = residuals(x[None])[0]
+    value = float(r @ r)
+    damping = 1e-2
+    eye = np.eye(n)
     for _ in range(MAX_ITERATIONS):
-        probes = np.concatenate([x[None] + GRADIENT_STEP * np.eye(n), x[None] - GRADIENT_STEP * np.eye(n)])
-        values = objective(probes)
-        gradient = (values[:n] - values[n:]) / (2.0 * GRADIENT_STEP)
-        new, new_value = x, value
-        while True:
-            candidate = np.clip(x - alpha * gradient, -bound, bound)
-            candidate_value = float(objective(candidate[None])[0])
-            if candidate_value <= value - ARMIJO * float(gradient @ (x - candidate)) or alpha < MIN_STEP:
-                new, new_value = candidate, candidate_value
+        rows = residuals(np.concatenate([x[None], x[None] + JACOBIAN_STEP * eye]))
+        r = rows[0]
+        jacobian = (rows[1:] - r) / JACOBIAN_STEP  # (n, R): row i is the residual's slope along x_i
+        gradient, hessian = jacobian @ r, jacobian @ jacobian.T
+        moved = 0.0
+        for _ in range(MAX_TRIALS):
+            step = -linalg.solve(hessian + damping * np.diag(np.diag(hessian)), gradient)
+            candidate = np.clip(x + step, -bound, bound)
+            trial = residuals(candidate[None])[0]
+            trial_value = float(trial @ trial)
+            if trial_value < value:
+                moved, x, value = float(np.max(np.abs(candidate - x))), candidate, trial_value
+                damping = max(damping / 3.0, 1e-9)
                 break
-            alpha *= 0.5
-        moved = float(np.max(np.abs(new - x)))
-        x, value = new, new_value
-        alpha = min(2.0 * alpha, 1.0)
+            damping *= 4.0
         if moved < STOP_STEP:
             break
     return x
@@ -346,12 +390,18 @@ def repair(
     loop: bool,
     half_spaces: tuple[HalfSpace, ...] = (),
     fps: float = 30.0,
+    margin_m: float = MARGIN_M,
+    obstacles: dict[str, tuple[np.ndarray, np.ndarray, float]] | None = None,
 ) -> tuple[dict[str, np.ndarray], RepairReport]:
     """Turns the limbs of a clip off each other and off the trunk where their capsules overlap.
 
-    `rot` is the clip's local rotation keys (xyzw, (F, 4)) by joint name and `root_translation` the pelvis's keys. The
-    result is a copy of `rot` in which only the joints of limbs that needed it differ, with the report."""
-    solver = _Solver(figure, roles, capsules, rot, np.asarray(root_translation, float), half_spaces, fps)
+    `rot` is the clip's local rotation keys (xyzw, (F, 4)) by joint name and `root_translation` the pelvis's keys. Two
+    capsules count as penetrating when they are closer than their radii plus `margin_m`: a capsule is the 90th percentile
+    of its mesh, so a thumb or a cuff pokes a few centimetres past it, and a figure in thick cloth wants a wider margin.
+    `obstacles` are extra things the forearms and hands keep clear of, each (start (F, 3), end (F, 3), radius): a skirt's
+    chains as baked for this clip, which the limbs cannot push (they are not part of the body). The result is a copy of
+    `rot` in which only the joints of limbs that needed it differ, with the report."""
+    solver = _Solver(figure, roles, capsules, rot, np.asarray(root_translation, float), half_spaces, fps, margin_m, obstacles or {})
     before = solver.frame_depths(rot)
     worst_before = float(max(before.max(), 0.0)) if len(before) else 0.0
     bad = np.flatnonzero(before > 0.0)
@@ -374,21 +424,28 @@ def repair(
         for k, limb in enumerate(limbs):
             slot(limb)[f] = solved[6 * k : 6 * k + 6]
 
-    # 2. Smooth over time, re-solve what the smoothing let back in (an extra turn on the smoothed keys), smooth lightly.
-    smoothed = {limb: _gaussian(delta, FIRST_SIGMA, loop) for limb, delta in limbs_seen.items()}
-    current = _apply(rot, solver, smoothed)
-    again = np.flatnonzero(solver.frame_depths(current) > 0.0)
-    if len(again):
-        solver_now = _Solver(figure, roles, capsules, current, solver.root_translation, half_spaces, fps)
+    # 2. Smooth over time, re-solve what the smoothing let back in (an extra turn on the smoothed keys), smooth lightly,
+    # then re-solve once more what that let back in: the solves sit on the clearance's edge, so any smoothing of them
+    # can cost a millimetre or two. Those last extra turns are not smoothed again.
+    def resolve(deltas: dict[tuple[str, str], np.ndarray]) -> None:
+        current = _apply(rot, solver, deltas)
+        again = np.flatnonzero(solver.frame_depths(current) > 0.0)
+        if not len(again):
+            return
+        solver_now = _Solver(figure, roles, capsules, current, solver.root_translation, half_spaces, fps, margin_m, obstacles or {})
         for f in again:
             f = int(f)
-            limbs = sorted(solver_now.active_limbs(f) | {limb for limb, delta in smoothed.items() if np.abs(delta[f]).max() > ACTIVE_DELTA})
+            limbs = sorted(solver_now.active_limbs(f) | {limb for limb, delta in deltas.items() if np.abs(delta[f]).max() > ACTIVE_DELTA})
             extra = solver_now.solve(f, limbs, np.zeros(6 * len(limbs)))
             for k, limb in enumerate(limbs):
-                if limb not in smoothed:
-                    smoothed[limb] = np.zeros((frames, 6))
-                smoothed[limb][f] = _compose_vectors(smoothed[limb][f], extra[6 * k : 6 * k + 6])
-        smoothed = {limb: _gaussian(delta, SECOND_SIGMA, loop) for limb, delta in smoothed.items()}
+                if limb not in deltas:
+                    deltas[limb] = np.zeros((frames, 6))
+                deltas[limb][f] = _compose_vectors(deltas[limb][f], extra[6 * k : 6 * k + 6])
+
+    smoothed = {limb: _gaussian(delta, FIRST_SIGMA, loop) for limb, delta in limbs_seen.items()}
+    resolve(smoothed)
+    smoothed = {limb: _gaussian(delta, SECOND_SIGMA, loop) for limb, delta in smoothed.items()}
+    resolve(smoothed)
     if loop:
         for delta in smoothed.values():
             delta[-1] = delta[0]

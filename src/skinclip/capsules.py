@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from . import linalg
 from .model import Figure
 
 # Trunk and head are fat and a cap on them only guards against a cape or a wing weighted to a spine joint; a limb that
@@ -70,16 +71,18 @@ def _segment_distances(points: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.n
     return np.linalg.norm(points - (a + t[:, None] * axis), axis=1)
 
 
-def measure(figure: Figure, roles: dict[str, str]) -> dict[str, Capsule]:
+def measure(figure: Figure, roles: dict[str, str], ignore_prefixes: tuple[str, ...] = ("skirt_",)) -> dict[str, Capsule]:
     """The capsules of a figure's bones, keyed by role (`upperarm_l`).
 
-    Only vertices a triangle uses count. A vertex belongs to the capsule of the nearest ancestor-or-self of its dominant
-    joint that starts one (so fingers count for the hand, eyes and jaw for the head). The radius is the 90th percentile
-    of those vertices' distances to the bone segment in the bind pose, never above the cap for the kind of bone; a
-    capsule with fewer than 8 vertices is 2 cm. A capsule whose joints the figure lacks is left out."""
+    Only vertices a triangle uses count, and not those whose dominant joint is a cloth chain (a name starting with one
+    of `ignore_prefixes`: a skirt is not the body it hangs from). A vertex belongs to the capsule of the nearest
+    ancestor-or-self of its dominant joint that starts one (so fingers count for the hand, eyes and jaw for the head).
+    The radius is the 90th percentile of those vertices' distances to the bone segment in the bind pose, never above
+    the cap for the kind of bone; a capsule with fewer than 8 vertices is 2 cm. A capsule whose joints the figure lacks
+    is left out."""
     skeleton = figure.skeleton
     slot = {skeleton.names[node]: i for i, node in enumerate(figure.joints)}
-    bind = np.linalg.inv(figure.inverse_bind)
+    bind = linalg.inverse_affine(figure.inverse_bind)
     present = [
         (name, start, end)
         for name, start, end in capsule_roles()
@@ -89,13 +92,14 @@ def measure(figure: Figure, roles: dict[str, str]) -> dict[str, Capsule]:
     used = np.unique(figure.triangles)
     dominant = figure.vertex_joints[used, np.argmax(figure.vertex_weights[used], axis=1)]
     owner = figure.joints[dominant]
+    cloth = np.array([skeleton.names[int(n)].startswith(ignore_prefixes) for n in owner], bool) if ignore_prefixes else np.zeros(len(owner), bool)
     capsule_of: dict[int, str | None] = {}
     for node in np.unique(owner):
         walk = int(node)
         while walk >= 0 and walk not in start_node:
             walk = int(skeleton.parent[walk])
         capsule_of[int(node)] = start_node.get(walk)
-    belongs = np.array([capsule_of[int(n)] for n in owner], dtype=object)
+    belongs = np.array([None if cloth[i] else capsule_of[int(n)] for i, n in enumerate(owner)], dtype=object)
     out: dict[str, Capsule] = {}
     for name, start, end in present:
         vertices = figure.positions[used[belongs == name]]
@@ -105,7 +109,7 @@ def measure(figure: Figure, roles: dict[str, str]) -> dict[str, Capsule]:
             if len(vertices) == 0:
                 continue
             b = a + 2.0 * (vertices.mean(0) - a)
-            offset = np.linalg.inv(bind[slot[roles[start]], :3, :3]) @ (b - a)
+            offset = linalg.inverse3(bind[slot[roles[start]], :3, :3]) @ (b - a)
         else:
             b = bind[slot[roles[end]], :3, 3]
         if len(vertices) < MIN_VERTICES:

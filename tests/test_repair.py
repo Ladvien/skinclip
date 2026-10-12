@@ -92,3 +92,19 @@ def test_body_capsules_of_the_tube_humanoid(tube):
     assert caps["upperarm_l"].radius_m == pytest.approx(0.05, abs=0.003)
     assert caps["thigh_r"].radius_m == pytest.approx(0.07, abs=0.003)
     assert caps["hand_l"].end is None and caps["hand_l"].centroid_offset is not None
+
+
+def test_a_hand_keeps_clear_of_an_obstacle_it_cannot_push(tube):
+    figure, roles, caps, rot, translation = tube
+    frames = len(translation)
+    # A post planted where the swinging left forearm and hand would pass, beside the hip: 0.30 m out, 1.0 to 1.4 m up.
+    post = (np.tile([0.30, 1.0, 0.0], (frames, 1)), np.tile([0.30, 1.4, 0.0], (frames, 1)), 0.04)
+    rest_rot = {joint: np.tile([0.0, 0.0, 0.0, 1.0], (frames, 1)) for joint in rot}  # an arm held out in T never meets it
+    _, none = repair.repair(figure, roles, caps, rest_rot, translation, loop=False, obstacles={"post": post})
+    assert none.frames_repaired == 0
+    hanging = dict(rest_rot)
+    half = -np.radians(80.0) / 2.0
+    hanging[roles["upperarm_l"]] = np.tile([0.0, 0.0, np.sin(half), np.cos(half)], (frames, 1))
+    fixed, report = repair.repair(figure, roles, caps, hanging, translation, loop=False, obstacles={"post": post})
+    assert report.worst_depth_m_before > 0.02 and report.worst_depth_m_after <= 0.002
+    assert set(report.joints_changed) <= {roles["upperarm_l"], roles["lowerarm_l"]}

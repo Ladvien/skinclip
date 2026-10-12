@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from . import linalg
+
 if TYPE_CHECKING:  # intersect imports this module; the settings are only read here
     from .intersect import CheckSettings
 
@@ -73,7 +75,7 @@ def crease_zones(
     `radius_m` of the joint's bind position. Two triangles that share a joint here fold together at it when it
     bends. The columns of joints whose name starts with a `non_crease_prefixes` entry stay False: a skirt chain is
     not a hinge, and a crossing near one is a crossing."""
-    joints = np.linalg.inv(inverse_bind)[:, :3, 3]
+    joints = linalg.inverse_affine(inverse_bind)[:, :3, 3]
     corners = positions[triangles]
     points = np.concatenate([corners, corners.mean(1, keepdims=True)], 1)  # (T, 4, 3)
     near = np.zeros((len(triangles), len(joints)), bool)
